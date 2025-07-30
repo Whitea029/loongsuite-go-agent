@@ -67,7 +67,6 @@ func einoPromptCallbackHandler() *callbacksutils.PromptCallbackHandler {
 func einoModelCallHandler(config ChatModelConfig) *callbacksutils.ModelCallbackHandler {
 	return &callbacksutils.ModelCallbackHandler{
 		OnStart: func(ctx context.Context, runInfo *callbacks.RunInfo, input *model.CallbackInput) context.Context {
-			clientConfig := input.Config
 			request := einoLLMRequest{
 				operationName:    "chat",
 				serverAddress:    config.BaseURL,
@@ -76,12 +75,17 @@ func einoModelCallHandler(config ChatModelConfig) *callbacksutils.ModelCallbackH
 				seed:             config.Seed,
 				topK:             config.TopK,
 			}
-			if clientConfig != nil {
-				request.modelName = clientConfig.Model
-				request.maxTokens = int64(clientConfig.MaxTokens)
-				request.temperature = float64(clientConfig.Temperature)
-				request.stopSequences = clientConfig.Stop
-				request.topP = float64(clientConfig.TopP)
+			if input != nil {
+				if input.Messages != nil {
+					request.input = input.Messages
+				}
+				if input.Config != nil {
+					request.modelName = input.Config.Model
+					request.maxTokens = int64(input.Config.MaxTokens)
+					request.temperature = float64(input.Config.Temperature)
+					request.stopSequences = input.Config.Stop
+					request.topP = float64(input.Config.TopP)
+				}
 			}
 			ctx = einoLLMInstrument.Start(ctx, request)
 			return context.WithValue(ctx, llmRequestKey{}, request)
@@ -89,21 +93,27 @@ func einoModelCallHandler(config ChatModelConfig) *callbacksutils.ModelCallbackH
 		OnEnd: func(ctx context.Context, runInfo *callbacks.RunInfo, output *model.CallbackOutput) context.Context {
 			request := ctx.Value(llmRequestKey{}).(einoLLMRequest)
 			response := einoLLMResponse{}
-			if output.TokenUsage != nil {
-				response.usageOutputTokens = int64(output.TokenUsage.CompletionTokens)
-				request.usageInputTokens = int64(output.TokenUsage.PromptTokens)
-			}
-			if output.Message != nil && output.Message.ResponseMeta != nil {
-				response.responseFinishReasons = []string{output.Message.ResponseMeta.FinishReason}
-			}
-			if output.Config != nil {
-				response.responseModel = output.Config.Model
+			if output != nil {
+				if output.TokenUsage != nil {
+					response.usageOutputTokens = int64(output.TokenUsage.CompletionTokens)
+					request.usageInputTokens = int64(output.TokenUsage.PromptTokens)
+				}
+				if output.Message != nil && output.Message.ResponseMeta != nil {
+					response.responseFinishReasons = []string{output.Message.ResponseMeta.FinishReason}
+				}
+				if output.Config != nil {
+					response.responseModel = output.Config.Model
+				}
+				if output.Message != nil {
+					response.output = output.Message.Content
+				}
 			}
 			einoLLMInstrument.End(ctx, request, response, nil)
 			return ctx
 		},
 		OnEndWithStreamOutput: func(ctx context.Context, runInfo *callbacks.RunInfo, output *schema.StreamReader[*model.CallbackOutput]) context.Context {
 			request := ctx.Value(llmRequestKey{}).(einoLLMRequest)
+			response := einoLLMResponse{}
 			go func() {
 				defer func() {
 					err := recover()
@@ -112,7 +122,6 @@ func einoModelCallHandler(config ChatModelConfig) *callbacksutils.ModelCallbackH
 					}
 					output.Close()
 				}()
-				response := einoLLMResponse{}
 				var outs []*model.CallbackOutput
 				firstTokenTime := time.Now()
 				for {
@@ -143,10 +152,12 @@ func einoModelCallHandler(config ChatModelConfig) *callbacksutils.ModelCallbackH
 					message, err := schema.ConcatMessages(mas)
 					if err == nil {
 						response.responseFinishReasons = []string{message.ResponseMeta.FinishReason}
+						response.output = message.Content
 					}
 				}
 				if usage != nil {
 					response.usageOutputTokens = int64(usage.CompletionTokens)
+					response.usageTotalTokens = int64(usage.TotalTokens)
 					request.usageInputTokens = int64(usage.PromptTokens)
 				}
 				response.responseModel = request.modelName
@@ -368,17 +379,17 @@ func einoTransformCallbackHandler() *callbacksutils.TransformerCallbackHandler {
 			request := einoRequest{operationName: "transform"}
 			request = extractCallbackInput(input, request)
 			ctx = einoCommonInstrument.Start(ctx, request)
-			return context.WithValue(ctx, toolRequestKey{}, request)
+			return context.WithValue(ctx, transformRequestKey{}, request)
 		},
 		OnEnd: func(ctx context.Context, runInfo *callbacks.RunInfo, output *document.TransformerCallbackOutput) context.Context {
-			request := ctx.Value(toolRequestKey{}).(einoRequest)
+			request := ctx.Value(transformRequestKey{}).(einoRequest)
 			response := einoResponse{operationName: "transform"}
 			response = extractCallbackOutput(output, response)
 			einoCommonInstrument.End(ctx, request, response, nil)
 			return ctx
 		},
 		OnError: func(ctx context.Context, runInfo *callbacks.RunInfo, err error) context.Context {
-			request := ctx.Value(toolRequestKey{}).(einoRequest)
+			request := ctx.Value(transformRequestKey{}).(einoRequest)
 			response := einoResponse{operationName: "transform"}
 			einoCommonInstrument.End(ctx, request, response, err)
 			return ctx
@@ -392,10 +403,16 @@ type ComposeHandler struct {
 
 var _ callbacks.Handler = ComposeHandler{}
 
+var _ callbacks.TimingChecker = ComposeHandler{}
+
 func NewComposeHandler(operationName string) *ComposeHandler {
 	return &ComposeHandler{
 		operationName: operationName,
 	}
+}
+
+func (c ComposeHandler) Needed(ctx context.Context, runInfo *callbacks.RunInfo, timing callbacks.CallbackTiming) bool {
+	return true
 }
 
 func (c ComposeHandler) OnStart(ctx context.Context, info *callbacks.RunInfo, input callbacks.CallbackInput) context.Context {
@@ -405,14 +422,14 @@ func (c ComposeHandler) OnStart(ctx context.Context, info *callbacks.RunInfo, in
 
 func (c ComposeHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, output callbacks.CallbackOutput) context.Context {
 	request := einoRequest{operationName: c.operationName}
-	response := einoResponse{operationName: "transform"}
+	response := einoResponse{operationName: c.operationName}
 	einoCommonInstrument.End(ctx, request, response, nil)
 	return ctx
 }
 
 func (c ComposeHandler) OnError(ctx context.Context, info *callbacks.RunInfo, err error) context.Context {
 	request := einoRequest{operationName: c.operationName}
-	response := einoResponse{operationName: "transform"}
+	response := einoResponse{operationName: c.operationName}
 	einoCommonInstrument.End(ctx, request, response, err)
 	return ctx
 }
@@ -424,7 +441,7 @@ func (c ComposeHandler) OnStartWithStreamInput(ctx context.Context, info *callba
 
 func (c ComposeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks.RunInfo, output *schema.StreamReader[callbacks.CallbackOutput]) context.Context {
 	request := einoRequest{operationName: c.operationName}
-	response := einoResponse{operationName: "transform"}
+	response := einoResponse{operationName: c.operationName}
 	einoCommonInstrument.End(ctx, request, response, nil)
 	return ctx
 }
